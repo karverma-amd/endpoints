@@ -47,11 +47,22 @@ except ImportError:
     _nltk = None
 
 from ..core.record import EventRecord, EventType, SampleEventType
+from ..core.types import TextModelOutput
 from ..dataset_manager.dataset import Dataset
 from ..dataset_manager.predefined.shopify_product_catalogue import ProductMetadata
 from .extractor import Extractor, PythonCodeExtractor
 
 logger = logging.getLogger(__name__)
+
+
+def _join_output_parts(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (tuple, list)):
+        return "".join(str(part) for part in value)
+    return str(value)
 
 
 class Scorer(ABC):
@@ -151,7 +162,10 @@ class Scorer(ABC):
                     continue
                 record = decoder.decode(stripped)
                 if record.event_type == SampleEventType.COMPLETE:
-                    output_text = str(record.data) if record.data is not None else ""
+                    if isinstance(record.data, TextModelOutput):
+                        output_text = _join_output_parts(record.data.output)
+                    else:
+                        output_text = str(record.data) if record.data is not None else ""
                     outputs.append(
                         {"sample_uuid": record.sample_uuid, "output": output_text}
                     )
