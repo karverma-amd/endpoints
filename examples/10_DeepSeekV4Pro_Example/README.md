@@ -28,7 +28,7 @@ export MODEL_PATH=${MODEL_DIR}/deepseek-ai/DeepSeek-V4-Pro
 export TOKENIZER_MODEL_PATH=${MODEL_PATH}  # host path for ISL/OSL/TPOT metrics
 ```
 
-Preflight scripts (`run_benchmark.sh`, `run_sglang_benchmark.sh`, `run_*_accuracy_benchmark.sh`) probe the inference server with `GET /health` and `GET /v1/models`. Override the base URL or wait time while a server is starting:
+Preflight scripts (`run_sglang_benchmark.sh`, `run_sglang_accuracy_benchmark.sh`) probe the inference server with `GET /health` and `GET /v1/models`. Override the base URL or wait time while a server is starting:
 
 ```bash
 export SGLANG_BASE_URL=http://127.0.0.1:30000    # default when SGLANG_PORT=30000
