@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Launch SGLang for DeepSeek-V4-Pro on ROCm (MI35x / DSv4 image).
-# Mirrors the FP4-experts env block from SGLang amd/deepseek_v4 run_dsv4.sh.
+# Launch SGLang for DeepSeek-V4-Pro on ROCm (MI35x).
+# Mirrors InferenceX benchmarks/single_node/fixed_seq_len/dsv4_fp4_mi355x_sglang.sh
+# against the DSv4 `_prs` image (baked open PRs; see verify_baked_patches).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,20 +17,17 @@ MODEL_REPO="${MODEL_REPO:-deepseek-ai/DeepSeek-V4-Pro}"
 PORT="${HTTP_PORT:-${SGLANG_PORT:-30000}}"
 TP="${TP:-8}"
 CONC="${CONC:-512}"
+ISL="${ISL:-8192}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 # Must be >= max_new_tokens (320k) + input so 320k-token generations aren't
 # capped by context length. Model supports up to 1M positions.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-327680}"
 DP_ATTENTION="${DP_ATTENTION:-false}"
 EP_SIZE="${EP_SIZE:-1}"
-# DSv4 tokenizer has no chat_template in tokenizer_config.json; SGLang needs --chat-template
-# for /v1/chat/completions. Default to the v3.2 tool template shipped in the DSv4 image.
-CHAT_TEMPLATE="${CHAT_TEMPLATE:-/sgl-workspace/sglang/examples/chat_template/tool_chat_template_deepseekv32.jinja}"
-if [[ ! -f "${CHAT_TEMPLATE}" ]]; then
-  CHAT_TEMPLATE=""
-fi
-SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260706}"
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-${SCRIPT_DIR}/chat_templates/deepseek_v4_thinking.jinja}"
+SGLANG_IMAGE="${SGLANG_IMAGE:-rocm/mlperf-inference:v0.5.16-rocm720-mi35x-20260803_prs}"
 RUN_MODE="${RUN_MODE:-host}"  # host | docker
+VERIFY_BAKED_PATCHES="${VERIFY_BAKED_PATCHES:-true}"
 
 patch_model_config() {
   local model_ref="$1"
@@ -51,32 +49,81 @@ else:
 PYEOF
 }
 
+# Five sglang PRs and one aiter PR that DSv4 wants are baked into the `_prs`
+# image (built from the upstream PR diffs). Verify instead of trusting the tag:
+# benchmarking unpatched sources would silently report the wrong configuration.
+resolve_pkg_dir() { # python package name -> directory of the installed package
+  # Drop the cwd entry from sys.path first: the image WORKDIR may hold a
+  # `sglang` source tree that otherwise shadows the installed package as a
+  # namespace package whose __file__ is None.
+  python3 -c "
+import sys
+sys.path = [p for p in sys.path if p not in ('', '.')]
+import importlib.util
+spec = importlib.util.find_spec('$1')
+print(next(iter(spec.submodule_search_locations)))
+"
+}
+
+require_baked_patch() { # PR label, file, fixed-string pattern, expected count
+  local got
+  got=$(grep -cF "$3" "$2" 2>/dev/null || true)
+  if [[ "${got}" == "$4" ]]; then
+    return 0
+  fi
+  echo "FATAL: $2 matched '$3' ${got:-0} time(s), expected $4. This image is" \
+    "missing $1; refusing to benchmark unpatched sources. Use" \
+    "${SGLANG_IMAGE} (or set VERIFY_BAKED_PATCHES=false)." >&2
+  exit 1
+}
+
+verify_baked_patches() {
+  local sglang_root aiter_root
+  sglang_root=$(resolve_pkg_dir sglang)
+  aiter_root=$(resolve_pkg_dir aiter)
+
+  require_baked_patch "sgl-project/sglang#32340" \
+    "${sglang_root}/kernels/ops/moe/fused_moe_triton_kernels.py" \
+    "BLOCK_K=triton.next_power_of_2(k)" 2
+  require_baked_patch "sgl-project/sglang#32577" \
+    "${sglang_root}/srt/models/deepseek_common/amd/deepseek_v4_fused_mhc.py" \
+    "try_aiter_fused_mhc_post_pre" 2
+  require_baked_patch "sgl-project/sglang#33165" \
+    "${sglang_root}/srt/layers/quantization/fp8_utils.py" \
+    "bpreshuffle_fp8_scale_nocopy" 3
+  require_baked_patch "sgl-project/sglang#33166" \
+    "${sglang_root}/srt/models/deepseek_common/attention_forward_methods/forward_mla.py" \
+    "bpreshuffle_fp8_scale_nocopy_tuple" 3
+  # v0.5.16_prs still ships the pre-rename flag; newer images use
+  # SGLANG_OPT_USE_AITER_BATCHED_GEMM. Accept either marker.
+  local environ_py="${sglang_root}/srt/environ.py"
+  local batched_got
+  batched_got=$(grep -cE 'SGLANG_OPT_(USE_AITER_BATCHED_GEMM|WO_A_AITER_BATCHED_GEMM)' \
+    "${environ_py}" 2>/dev/null || true)
+  if [[ "${batched_got}" -lt 1 ]]; then
+    echo "FATAL: ${environ_py} is missing sgl-project/sglang#33313" \
+      "(SGLANG_OPT_*AITER_BATCHED_GEMM). Refusing to continue." >&2
+    exit 1
+  fi
+  require_baked_patch "ROCm/aiter#4506" \
+    "${aiter_root}/ops/triton/quant/fused_fp8_quant.py" \
+    "out1_bs = out1_bs.transpose(0, 1)" 2
+  echo "Verified sglang #32340/#32577/#33165/#33166/#33313 and aiter #4506 are baked in."
+}
+
 export_sglang_env() {
-  # Triton/AITER fallback env block for the stock lmsysorg sglang-rocm image,
-  # which does not ship deep_gemm/tilelang kernels. Routes the DSv4 attention
-  # backend around deep_gemm (unified_kv_triton flashmla, triton fused compress,
-  # torch paged MQA logits, aiter indexer instead of tilelang).
   export SGLANG_DEFAULT_THINKING=1
   export SGLANG_DSV4_REASONING_EFFORT=max
-  export SGLANG_OPT_DEEPGEMM_HC_PRENORM=false
-  export SGLANG_USE_AITER=1
   export SGLANG_USE_ROCM700A=0
-  export SGLANG_DP_USE_GATHERV=1
-  export SGLANG_OPT_USE_FUSED_COMPRESS=true
   export SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
-  export SGLANG_OPT_FP8_WO_A_GEMM=false
-  export SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
-  export SGLANG_OPT_USE_TOPK_V2=false
-  export SGLANG_OPT_USE_AITER_INDEXER=true
-  export SGLANG_OPT_USE_TILELANG_INDEXER=false
-  export SGLANG_OPT_USE_TILELANG_MHC_PRE=false
-  export SGLANG_OPT_USE_TILELANG_MHC_POST=false
-  export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
-  export SGLANG_OPT_USE_FUSED_COMPRESS_TRITON=true
+  # sglang defaults SGLANG_USE_AITER to False; leaving it unset disables the
+  # aiter MoE/quant path and strands the baked PRs above.
+  export SGLANG_USE_AITER=1
   export AITER_BF16_FP8_MOE_BOUND=0
-  export SGLANG_EAGER_INPUT_NO_COPY=true
-  export SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false
-  export SGLANG_ROCM_USE_MULTI_STREAM=false
+  # sglang#33313: export both names so v0.5.16_prs (WO_A_*) and newer
+  # (_USE_AITER_*) images both pick up the opt-in.
+  export SGLANG_OPT_WO_A_AITER_BATCHED_GEMM=1
+  export SGLANG_OPT_USE_AITER_BATCHED_GEMM=1
 }
 
 launch_sglang_server() {
@@ -87,25 +134,47 @@ launch_sglang_server() {
   fi
 
   local parallel_args=(--tensor-parallel-size "${TP}")
+  local chunked_prefill_size="${ISL}"
+  local moe_fusion_args
+  # Shared-experts fusion and the DP shared-expert optimisations are mutually
+  # exclusive: fusion folds the shared expert into the MoE and strands
+  # SGLANG_SHARED_EXPERT_TP1 / SGLANG_DP_SHARED_EXPERT_LOCAL. Enable fusion only
+  # on the pure-TP (dp-attn:false) path; under DP attention disable it.
   if [[ "${DP_ATTENTION}" == "true" ]]; then
     export SGLANG_SHARED_EXPERT_TP1=1
     export SGLANG_DP_SHARED_EXPERT_LOCAL=1
     export SGLANG_DP_USE_GATHERV=1
     export SGLANG_DP_USE_REDUCE_SCATTER=1
     export GPU_MAX_HW_QUEUES=5
-    parallel_args+=(--dp "${TP}" --enable-dp-attention --enable-prefill-delayer --enable-two-batch-overlap)
+    chunked_prefill_size=$((ISL * TP))
+    parallel_args+=(
+      --dp "${TP}"
+      --enable-dp-attention
+      --enable-prefill-delayer
+      --enable-two-batch-overlap
+    )
+    moe_fusion_args=(--disable-shared-experts-fusion)
+  else
+    moe_fusion_args=(--enforce-shared-experts-fusion)
   fi
   if [[ "${EP_SIZE:-1}" -gt 1 ]]; then
     parallel_args+=(--ep-size "${EP_SIZE}")
   fi
 
   local chat_template_args=()
-  if [[ -n "${CHAT_TEMPLATE}" ]]; then
+  if [[ -n "${CHAT_TEMPLATE}" && -f "${CHAT_TEMPLATE}" ]]; then
     chat_template_args=(--chat-template "${CHAT_TEMPLATE}")
+  elif [[ -n "${CHAT_TEMPLATE}" ]]; then
+    echo "WARNING: CHAT_TEMPLATE=${CHAT_TEMPLATE} not found; launching without --chat-template" >&2
+  fi
+
+  local serve_cmd=(python3 -m sglang.launch_server)
+  if command -v sglang >/dev/null 2>&1; then
+    serve_cmd=(sglang serve)
   fi
 
   # SGLANG_PORT must stay unset: see PORT comment above.
-  env -u SGLANG_PORT python3 -m sglang.launch_server \
+  env -u SGLANG_PORT "${serve_cmd[@]}" \
     --model-path "${model_path}" \
     --host=0.0.0.0 \
     --port "${PORT}" \
@@ -120,8 +189,8 @@ launch_sglang_server() {
     --page-size 256 \
     --kv-cache-dtype fp8_e4m3 \
     --context-length "${MAX_MODEL_LEN}" \
-    --chunked-prefill-size 8192 \
-    --disable-shared-experts-fusion \
+    --chunked-prefill-size "${chunked_prefill_size}" \
+    "${moe_fusion_args[@]}" \
     --tool-call-parser deepseekv4 \
     --reasoning-parser deepseek-v4 \
     "${chat_template_args[@]}" \
@@ -168,11 +237,14 @@ if [[ "${RUN_MODE}" == "docker" && ! -f /.dockerenv ]]; then
   # shellcheck disable=SC2207
   STORAGE_OPTS=($(docker_storage_args))
   echo "Docker log mount: ${LOG_DIR} -> /workspace"
+  echo "Docker image: ${SGLANG_IMAGE}"
   DOCKER_RUN_ARGS=(--rm -it)
   if [[ -n "${DOCKER_NAME:-}" ]]; then
     docker rm -f "${DOCKER_NAME}" 2>/dev/null || true
     DOCKER_RUN_ARGS=(--name "${DOCKER_NAME}" -d)
   fi
+
+  CHAT_TEMPLATE_DOCKER="/chat_templates/deepseek_v4_thinking.jinja"
   docker run "${DOCKER_RUN_ARGS[@]}" \
     "${STORAGE_OPTS[@]}" \
     --device=/dev/kfd \
@@ -183,19 +255,23 @@ if [[ "${RUN_MODE}" == "docker" && ! -f /.dockerenv ]]; then
     -v "${MODEL}:${MODEL}:ro" \
     -v "${HF_HOME}:/root/.cache/huggingface" \
     -v "${LOG_DIR}:/workspace:rw" \
+    -v "${SCRIPT_DIR}/chat_templates:/chat_templates:ro" \
     -e HF_TOKEN="${HF_TOKEN:-}" \
     -e MODEL="${MODEL}" \
     -e MODEL_REPO="${MODEL_REPO}" \
     -e HTTP_PORT="${PORT}" \
     -e TP="${TP}" \
     -e CONC="${CONC}" \
+    -e ISL="${ISL}" \
     -e MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC}" \
     -e MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
     -e DP_ATTENTION="${DP_ATTENTION}" \
     -e EP_SIZE="${EP_SIZE}" \
-    -e CHAT_TEMPLATE="${CHAT_TEMPLATE}" \
+    -e CHAT_TEMPLATE="${CHAT_TEMPLATE_DOCKER}" \
     -e EVAL_ONLY="${EVAL_ONLY:-false}" \
     -e EVAL_MAX_MODEL_LEN="${EVAL_MAX_MODEL_LEN:-}" \
+    -e VERIFY_BAKED_PATCHES="${VERIFY_BAKED_PATCHES}" \
+    -e SGLANG_IMAGE="${SGLANG_IMAGE}" \
     -e RUN_MODE=host \
     -e SERVER_LOG=/workspace/server.log \
     -e LOG_DIR=/workspace \
@@ -206,6 +282,10 @@ if [[ "${RUN_MODE}" == "docker" && ! -f /.dockerenv ]]; then
   exit 0
 fi
 
-echo "Starting SGLang on port ${PORT} with model ${MODEL} (TP=${TP}, CONC=${CONC})"
+if [[ "${VERIFY_BAKED_PATCHES}" == "true" ]]; then
+  verify_baked_patches
+fi
+
+echo "Starting SGLang on port ${PORT} with model ${MODEL} (TP=${TP}, CONC=${CONC}, ISL=${ISL}, DP_ATTENTION=${DP_ATTENTION})"
 echo "Server log: ${SERVER_LOG}"
 launch_sglang_server "${MODEL}" 2>&1 | tee -a "${SERVER_LOG}"

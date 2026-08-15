@@ -48,15 +48,18 @@ hf download "${MODEL_NAME}" --local-dir "${MODEL_PATH}"
 
 ## SGLang (ROCm / MI35x)
 
-SGLang serves DeepSeek-V4-Pro on ROCm using the DSv4-tuned image and FP4-experts env flags from the
-`amd/deepseek_v4` branch. Before launch, patch `config.json` so `model_type` is `deepseek_v3`
-(SGLang registry compatibility).
+SGLang serves DeepSeek-V4-Pro on ROCm using the DSv4 `_prs` image
+(`rocm/mlperf-inference:v0.5.16-rocm720-mi35x-20260803_prs`), which bakes open
+sglang/aiter PRs needed for shared-experts fusion, aiter mHC, and bpreshuffle
+no-copy scale paths. Before launch, patch `config.json` so `model_type` is
+`deepseek_v3` (SGLang registry compatibility).
 
 ### Launch Server
 
 **Option A: helper script (host or container)**
 
-On a ROCm host with SGLang installed:
+On a ROCm host with SGLang installed (must be the `_prs` build, or set
+`VERIFY_BAKED_PATCHES=false`):
 
 ```bash
 export MODEL_PATH=/data/workloads-inference/models/deepseek-ai/DeepSeek-V4-Pro
@@ -66,37 +69,42 @@ export CONC=512
 ./examples/10_DeepSeekV4Pro_Example/start_sglang_server.sh
 ```
 
-Inside the DSv4 Docker image (model directory must exist on the host):
+Via Docker (model directory must exist on the host):
 
 ```bash
 export MODEL_PATH=/data/workloads-inference/models/deepseek-ai/DeepSeek-V4-Pro
 export RUN_MODE=docker
-export SGLANG_IMAGE=rocm/sgl-dev:rocm720-mi35x-f96ac98-20260526-DSv4
+export SGLANG_IMAGE=rocm/mlperf-inference:v0.5.16-rocm720-mi35x-20260803_prs
 ./examples/10_DeepSeekV4Pro_Example/start_sglang_server.sh
 ```
 
 Optional overrides:
 
-| Variable                    | Default   | Description                                                                                                                   |
-| --------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `SGLANG_PORT` / `HTTP_PORT` | `30000`   | HTTP listen port (`start_sglang_server.sh` unsets `SGLANG_PORT` before launch — SGLang uses that name for internal ZMQ ports) |
-| `TP`                        | `8`       | Tensor parallel size                                                                                                          |
-| `CONC`                      | `512`     | `--max-running-requests`                                                                                                      |
-| `MAX_MODEL_LEN`             | `98304`   | `--context-length`                                                                                                            |
-| `DP_ATTENTION`              | `false`   | Set `true` to enable DP attention                                                                                             |
-| `EP_SIZE`                   | `1`       | Expert parallel size (`>1` adds `--ep-size`)                                                                                  |
-| `CHAT_TEMPLATE`             | _(unset)_ | Optional path to `deepseek_v4_thinking.jinja`                                                                                 |
+| Variable                    | Default                                                         | Description                                                                                                                   |
+| --------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `SGLANG_PORT` / `HTTP_PORT` | `30000`                                                         | HTTP listen port (`start_sglang_server.sh` unsets `SGLANG_PORT` before launch — SGLang uses that name for internal ZMQ ports) |
+| `TP`                        | `8`                                                             | Tensor parallel size                                                                                                          |
+| `CONC`                      | `512`                                                           | `--max-running-requests` / `--cuda-graph-max-bs`                                                                              |
+| `ISL`                       | `8192`                                                          | Chunked-prefill size (`ISL * TP` when `DP_ATTENTION=true`)                                                                    |
+| `MAX_MODEL_LEN`             | `327680`                                                        | `--context-length`                                                                                                            |
+| `DP_ATTENTION`              | `false`                                                         | `true` enables DP attention + disables shared-experts fusion; `false` uses `--enforce-shared-experts-fusion`                  |
+| `EP_SIZE`                   | `1`                                                             | Expert parallel size (`>1` adds `--ep-size`)                                                                                  |
+| `CHAT_TEMPLATE`             | `chat_templates/deepseek_v4_thinking.jinja`                     | Thinking chat template passed to `--chat-template`                                                                            |
+| `SGLANG_IMAGE`              | `rocm/mlperf-inference:v0.5.16-rocm720-mi35x-20260803_prs`      | Docker image when `RUN_MODE=docker`                                                                                           |
+| `VERIFY_BAKED_PATCHES`      | `true`                                                          | Refuse to launch if the baked sglang/aiter PR markers are missing                                                             |
 
-The script exports the FP4-experts ROCm flags (`SGLANG_DSV4_FP4_EXPERTS=True`,
-`SGLANG_FORCE_TRITON_MOE_FP8=0`, `SGLANG_REASONING_EFFORT=max`, etc.) and launches:
+The script exports `SGLANG_USE_AITER=1`, `SGLANG_OPT_*AITER_BATCHED_GEMM=1`, and
+the DSv4 thinking/effort flags, then launches (via `sglang serve` when available):
 
 ```text
-python3 -m sglang.launch_server \
+sglang serve \
   --model-path $MODEL \
   --tensor-parallel-size $TP \
-  --attention-backend compressed \
+  --attention-backend dsv4 \
+  --kv-cache-dtype fp8_e4m3 \
   --reasoning-parser deepseek-v4 \
   --tool-call-parser deepseekv4 \
+  --chat-template .../deepseek_v4_thinking.jinja \
   ...
 ```
 
@@ -116,24 +124,35 @@ if config.get("model_type") == "deepseek_v4":
         json.dump(config, f, indent=2)
 PYEOF
 
-# Export env block from start_sglang_server.sh, then:
-python3 -m sglang.launch_server \
+export SGLANG_DEFAULT_THINKING=1
+export SGLANG_DSV4_REASONING_EFFORT=max
+export SGLANG_USE_ROCM700A=0
+export SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
+export SGLANG_USE_AITER=1
+export AITER_BF16_FP8_MOE_BOUND=0
+export SGLANG_OPT_WO_A_AITER_BATCHED_GEMM=1
+export SGLANG_OPT_USE_AITER_BATCHED_GEMM=1
+
+sglang serve \
   --model-path "${MODEL_PATH}" \
   --host 0.0.0.0 \
   --port 30000 \
   --tensor-parallel-size 8 \
   --trust-remote-code \
   --disable-radix-cache \
-  --attention-backend compressed \
+  --attention-backend dsv4 \
+  --cuda-graph-max-bs 512 \
   --max-running-requests 512 \
   --mem-fraction-static 0.90 \
   --swa-full-tokens-ratio 0.15 \
   --page-size 256 \
-  --context-length 98304 \
+  --kv-cache-dtype fp8_e4m3 \
+  --context-length 327680 \
   --chunked-prefill-size 8192 \
-  --disable-shared-experts-fusion \
+  --enforce-shared-experts-fusion \
   --tool-call-parser deepseekv4 \
   --reasoning-parser deepseek-v4 \
+  --chat-template examples/10_DeepSeekV4Pro_Example/chat_templates/deepseek_v4_thinking.jinja \
   --watchdog-timeout 1800
 ```
 
@@ -253,7 +272,8 @@ back to the subprocess path automatically.
 
 - Verify: `curl http://localhost:30000/health`
 - Confirm `SGLANG_PORT` matches `endpoint_config.endpoints` in the SGLang YAML
-- For ROCm, use the DSv4 image: `rocm/sgl-dev:rocm720-mi35x-f96ac98-20260526-DSv4`
+- For ROCm, use the DSv4 `_prs` image:
+  `rocm/mlperf-inference:v0.5.16-rocm720-mi35x-20260803_prs`
 
 **SGLang `address already in use` on `--port`**
 
@@ -264,7 +284,7 @@ back to the subprocess path automatically.
 **SGLang fails to load model / unknown architecture**
 
 - Run the `config.json` patch (`model_type`: `deepseek_v4` → `deepseek_v3`) before launch
-- Confirm `SGLANG_DSV4_FP4_EXPERTS=True` for the original HF checkpoint with MXFP4 experts
+- Confirm `SGLANG_USE_AITER=1` and that baked-patch verification passes on the `_prs` image
 
 **LiveCodeBench scoring fails / Connection refused on port 13835**
 
