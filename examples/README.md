@@ -31,9 +31,8 @@ Sample yaml configuration to benchmark the multimodal `Qwen/Qwen3-VL-235B-A22B` 
 
 ### [10_DeepSeekV4Pro_Example](10_DeepSeekV4Pro_Example/)
 
-End-to-end example for benchmarking `deepseek-ai/DeepSeek-V4-Pro` with SGLang (ROCm),
-using the same datasets as the GPT-OSS-120B example (performance parquet + AIME25 + GPQA +
-LiveCodeBench).
+Pass@1 accuracy suite for `deepseek-ai/DeepSeek-V4-Pro` with SGLang (ROCm / MI35x):
+AIME25 + GPQA + LiveCodeBench at concurrency 64 and `max_new_tokens` 256000.
 
 ## Getting Help
 

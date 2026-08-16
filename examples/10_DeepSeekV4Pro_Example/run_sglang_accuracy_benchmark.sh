@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Accuracy-only DeepSeek-V4-Pro benchmark against SGLang (GPQA + AIME25 + LCB).
-# Workflow mirrors examples/04_GPTOSS120B_Example/run.py + from-config accuracy YAML.
+# Pass@1 accuracy suite for DeepSeek-V4-Pro (AIME25 → GPQA → LiveCodeBench).
+# Matches the validated recipe: target_concurrency=64, max_new_tokens=256000.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -8,15 +8,15 @@ ENDPOINTS_DIR="${ENDPOINTS_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 # shellcheck source=docker_common.sh
 source "${SCRIPT_DIR}/docker_common.sh"
 
-CONFIG="${CONFIG:-${SCRIPT_DIR}/sglang_deepseek_v4_pro_accuracy.yaml}"
 SGLANG_PORT="${SGLANG_PORT:-30000}"
 LCB_PORT="${LCB_PORT:-13835}"
-# CLI wall-clock for from-config (multi-hour accuracy + LCB); override if needed.
-TIMEOUT="${TIMEOUT:-86400}"
-# Host log volume for docker --storage-opt when DOCKER_USE_LOG_STORAGE_OPT=true.
+TIMEOUT="${TIMEOUT:-1209600}"
 export DOCKER_LOG_STORAGE_GB="${DOCKER_LOG_STORAGE_GB:-64}"
-# Accuracy phases drain with no timeout by default (settings.drain.accuracy_timeout_s).
 export ALLOW_LCB_LOCAL_EVAL="${ALLOW_LCB_LOCAL_EVAL:-true}"
+
+AIME_CFG="${AIME_CFG:-${SCRIPT_DIR}/sglang_deepseek_v4_pro_aime_pass1.yaml}"
+GPQA_CFG="${GPQA_CFG:-${SCRIPT_DIR}/sglang_deepseek_v4_pro_gpqa_pass1.yaml}"
+LCB_CFG="${LCB_CFG:-${SCRIPT_DIR}/sglang_deepseek_v4_pro_lcb_pass1.yaml}"
 
 cd "${ENDPOINTS_DIR}"
 
@@ -33,11 +33,10 @@ export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 
 if [[ -z "${TOKENIZER_MODEL_PATH:-}" ]]; then
-  export TOKENIZER_MODEL_PATH="${MODEL_PATH:-/data/workloads-inference/models/DeepSeek-V4-Pro}"
+  export TOKENIZER_MODEL_PATH="${MODEL_PATH:-/data/workloads-inference/hf_hub_cache/models--deepseek-ai--DeepSeek-V4-Pro/snapshots/b5968e9190ef611bbf34a7229255be88a0e937c1}"
 fi
 
-ensure_docker_log_dir "accuracy"
-
+ensure_docker_log_dir "accuracy_pass1"
 export LCB_DATASETS_DIR="${LCB_DATASETS_DIR:-${ENDPOINTS_DIR}/dataset_cache/livecodebench/release_v6}"
 
 echo "=== Pre-flight checks ==="
@@ -46,9 +45,8 @@ SGLANG_BASE_URL="${SGLANG_BASE_URL:-http://127.0.0.1:${SGLANG_PORT}}"
 WAIT_FOR_SGLANG_S="${WAIT_FOR_SGLANG_S:-0}"
 
 if ! wait_openai_compatible_server "${SGLANG_BASE_URL}" "${WAIT_FOR_SGLANG_S}"; then
-  echo "ERROR: Inference server not reachable at ${SGLANG_BASE_URL} (tried GET /health and GET /v1/models)." >&2
+  echo "ERROR: Inference server not reachable at ${SGLANG_BASE_URL}." >&2
   echo "  Start SGLang: ${SCRIPT_DIR}/start_sglang_server.sh" >&2
-  echo "  Smoke test: uv run python -m inference_endpoint.testing.echo_server --host 127.0.0.1 --port ${SGLANG_PORT}" >&2
   echo "  If the server is slow to bind: export WAIT_FOR_SGLANG_S=120" >&2
   exit 1
 fi
@@ -60,9 +58,9 @@ esac
 
 if [[ "${_allow_lcb_local}" == "true" ]]; then
   export ALLOW_LCB_LOCAL_EVAL=true
-  echo "ALLOW_LCB_LOCAL_EVAL=true — LiveCodeBench will use subprocess scoring (no lcb-service)"
+  echo "ALLOW_LCB_LOCAL_EVAL=true — LiveCodeBench uses local subprocess scoring"
   if [[ ! -d "${LCB_DATASETS_DIR}/test_cases" ]]; then
-    echo "LiveCodeBench test_cases missing — regenerating dataset cache (required for local scoring)..."
+    echo "LiveCodeBench test_cases missing — regenerating dataset cache..."
     uv run python -c "
 from pathlib import Path
 from inference_endpoint.dataset_manager.predefined.livecodebench import LiveCodeBench
@@ -85,27 +83,44 @@ else
 fi
 
 echo "Log directory (host): ${LOG_DIR}"
-echo "Accuracy phase drain: unlimited (settings.drain.accuracy_timeout_s default)"
 echo ""
 
-rm -rf "${ENDPOINTS_DIR}/results/sglang_deepseek_v4_pro_accuracy"
-echo "Cleared prior results: results/sglang_deepseek_v4_pro_accuracy/"
-echo ""
+run_one() {
+  local label=$1
+  local config=$2
+  local logf="${LOG_DIR}/${label}_pass1.log"
+  echo "=== Running ${label} pass@1 ==="
+  echo "Config: ${config}"
+  local cmd=(
+    uv run inference-endpoint benchmark from-config
+    -c "${config}"
+    --timeout "${TIMEOUT}"
+    --mode both
+  )
+  echo "${cmd[*]}"
+  set +e
+  "${cmd[@]}" 2>&1 | tee "${logf}"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  echo "${label}_EXIT=${rc} (log: ${logf})"
+  return "${rc}"
+}
 
-echo "=== Running accuracy benchmark (from-config) ==="
-BENCHMARK_LOG="${LOG_DIR}/accuracy_from_config.log"
-CMD=(
-  uv run inference-endpoint benchmark from-config
-  -c "${CONFIG}"
-  --timeout "${TIMEOUT}"
-  --mode both
-)
-echo "${CMD[*]}"
 set +e
-"${CMD[@]}" 2>&1 | tee "${BENCHMARK_LOG}"
-bench_rc=${PIPESTATUS[0]}
+run_one AIME "${AIME_CFG}"
+aime_rc=$?
+run_one GPQA "${GPQA_CFG}"
+gpqa_rc=$?
+run_one LCB "${LCB_CFG}"
+lcb_rc=$?
 set -e
 
 echo ""
-echo "Benchmark log: ${BENCHMARK_LOG}"
-exit "${bench_rc}"
+echo "=== Suite summary ==="
+echo "AIME_EXIT=${aime_rc} GPQA_EXIT=${gpqa_rc} LCB_EXIT=${lcb_rc}"
+echo "Reports:"
+echo "  results/sglang_deepseek_v4_pro_aime_pass1/accuracy/accuracy_results.json"
+echo "  results/sglang_deepseek_v4_pro_gpqa_pass1/accuracy/accuracy_results.json"
+echo "  results/sglang_deepseek_v4_pro_lcb_pass1/accuracy/accuracy_results.json"
+
+exit $(( aime_rc != 0 || gpqa_rc != 0 || lcb_rc != 0 ? 1 : 0 ))
