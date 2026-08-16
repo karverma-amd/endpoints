@@ -35,9 +35,9 @@ settings:
   load_pattern:
     type: concurrency
     target_qps: null
-    target_concurrency: 256
+    target_concurrency: 64
   client:
-    num_workers: 32
+    num_workers: 64
     worker_initialization_timeout: 1200.0
     warmup_connections: 0
     min_required_connections: 0

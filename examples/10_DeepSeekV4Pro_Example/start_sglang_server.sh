@@ -173,6 +173,11 @@ launch_sglang_server() {
     serve_cmd=(sglang serve)
   fi
 
+  local model_override_args=()
+  if [[ -n "${JSON_MODEL_OVERRIDE_ARGS:-}" ]]; then
+    model_override_args=(--json-model-override-args "${JSON_MODEL_OVERRIDE_ARGS}")
+  fi
+
   # SGLANG_PORT must stay unset: see PORT comment above.
   env -u SGLANG_PORT "${serve_cmd[@]}" \
     --model-path "${model_path}" \
@@ -194,6 +199,7 @@ launch_sglang_server() {
     --tool-call-parser deepseekv4 \
     --reasoning-parser deepseek-v4 \
     "${chat_template_args[@]}" \
+    "${model_override_args[@]}" \
     --watchdog-timeout 1800 \
     "${eval_context_args[@]}"
 }
@@ -203,19 +209,35 @@ if [[ ! -d "${MODEL}" && "${MODEL}" == *"/"* ]]; then
   patch_model_config "${MODEL_REPO}"
   MODEL="${MODEL_REPO}"
 elif [[ -f "${MODEL}/config.json" ]]; then
-  python3 <<PYEOF
-import json
+  # HF cache snapshots are often root-owned/read-only. Prefer an in-place
+  # config patch when writable; otherwise pass a runtime override.
+  unset JSON_MODEL_OVERRIDE_ARGS || true
+  set +e
+  python3 - "${MODEL}" <<'PYEOF'
+import json, sys
 from pathlib import Path
 
-path = Path("${MODEL}") / "config.json"
+path = Path(sys.argv[1]) / "config.json"
 config = json.loads(path.read_text())
-if config.get("model_type") == "deepseek_v4":
+model_type = config.get("model_type")
+if model_type != "deepseek_v4":
+    print(f"No patch needed: model_type is {model_type!r}")
+    raise SystemExit(0)
+try:
     config["model_type"] = "deepseek_v3"
     path.write_text(json.dumps(config, indent=2) + "\n")
-    print(f"Patched {path}: model_type deepseek_v4 -> deepseek_v3")
-else:
-    print(f"No patch needed: model_type is {config.get('model_type')!r}")
+except OSError as exc:
+    print(f"WARNING: cannot patch {path} ({exc}); using json-model-override-args")
+    raise SystemExit(2)
+print(f"Patched {path}: model_type deepseek_v4 -> deepseek_v3")
 PYEOF
+  patch_rc=$?
+  set -e
+  if [[ "${patch_rc}" -eq 2 ]]; then
+    export JSON_MODEL_OVERRIDE_ARGS='{"model_type":"deepseek_v3"}'
+  elif [[ "${patch_rc}" -ne 0 ]]; then
+    exit "${patch_rc}"
+  fi
 else
   patch_model_config "${MODEL_REPO}"
 fi
@@ -245,6 +267,18 @@ if [[ "${RUN_MODE}" == "docker" && ! -f /.dockerenv ]]; then
   fi
 
   CHAT_TEMPLATE_DOCKER="/chat_templates/deepseek_v4_thinking.jinja"
+  # Mount the model path and, when present, its HF cache root so relative
+  # snapshot->blob symlinks resolve inside the container.
+  MODEL_MOUNTS=(-v "${MODEL}:${MODEL}:ro")
+  if [[ -n "${HF_CACHE_ROOT:-}" && -d "${HF_CACHE_ROOT}" ]]; then
+    MODEL_MOUNTS+=(-v "${HF_CACHE_ROOT}:${HF_CACHE_ROOT}:ro")
+  elif [[ "${MODEL}" == *"/snapshots/"* ]]; then
+    # .../models--ORG--NAME/snapshots/HASH -> mount models--ORG--NAME
+    _model_repo_dir="$(dirname "$(dirname "${MODEL}")")"
+    if [[ -d "${_model_repo_dir}" ]]; then
+      MODEL_MOUNTS+=(-v "${_model_repo_dir}:${_model_repo_dir}:ro")
+    fi
+  fi
   docker run "${DOCKER_RUN_ARGS[@]}" \
     "${STORAGE_OPTS[@]}" \
     --device=/dev/kfd \
@@ -252,7 +286,7 @@ if [[ "${RUN_MODE}" == "docker" && ! -f /.dockerenv ]]; then
     --group-add video \
     --ipc=host \
     -p "127.0.0.1:${PORT}:${PORT}" \
-    -v "${MODEL}:${MODEL}:ro" \
+    "${MODEL_MOUNTS[@]}" \
     -v "${HF_HOME}:/root/.cache/huggingface" \
     -v "${LOG_DIR}:/workspace:rw" \
     -v "${SCRIPT_DIR}/chat_templates:/chat_templates:ro" \
@@ -271,6 +305,7 @@ if [[ "${RUN_MODE}" == "docker" && ! -f /.dockerenv ]]; then
     -e EVAL_ONLY="${EVAL_ONLY:-false}" \
     -e EVAL_MAX_MODEL_LEN="${EVAL_MAX_MODEL_LEN:-}" \
     -e VERIFY_BAKED_PATCHES="${VERIFY_BAKED_PATCHES}" \
+    -e JSON_MODEL_OVERRIDE_ARGS="${JSON_MODEL_OVERRIDE_ARGS:-}" \
     -e SGLANG_IMAGE="${SGLANG_IMAGE}" \
     -e RUN_MODE=host \
     -e SERVER_LOG=/workspace/server.log \
